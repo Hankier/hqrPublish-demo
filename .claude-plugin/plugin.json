@@ -1,0 +1,7 @@
+{
+  "name": "hqr-publish",
+  "version": "0.1.1",
+  "description": "Publish self-contained HTML pages (Calm HUD style) to your own Cloudflare R2 site with `pub`, and the go-publish skill that routes 'make me an artifact/overview' there",
+  "author": { "name": "Hankier" },
+  "repository": "https://github.com/Hankier/hqrPublish-demo"
+}

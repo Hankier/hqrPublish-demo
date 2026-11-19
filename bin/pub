@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""Publish an HTML page to your own pages site (PUB_BASE_URL, e.g. https://pages.example.com).
+
+  pub FILE              upload FILE; same file -> same link, new frozen version each time
+  pub FILE --name NAME  publish under a different file name (first publish only)
+  pub FILE --new        forget the old link and start a new one
+  pub --list            show everything published from this machine
+
+Each publish writes w/<token>/vN/<name> (frozen) and w/<token>/<name> (latest).
+Credentials: ~/.config/go-pub/credentials (bucket-scoped R2 token, Object Read & Write).
+PUB_BASE_URL (in that file or the environment) is the site address. Setup: README.md in the repo.
+"""
+import argparse
+import datetime
+import hashlib
+import hmac
+import json
+import mimetypes
+import os
+import re
+import secrets
+import sys
+import urllib.parse
+import urllib.request
+
+CONFIG_DIR = os.path.expanduser("~/.config/go-pub")
+CREDENTIALS = os.path.join(CONFIG_DIR, "credentials")
+MANIFEST = os.path.join(CONFIG_DIR, "manifest.json")
+
+
+def read_credentials():
+    creds = {}
+    try:
+        with open(CREDENTIALS) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    creds[k.strip()] = v.strip().strip('"')
+    except FileNotFoundError:
+        pass
+    return creds
+
+
+def base_url():
+    url = os.environ.get("PUB_BASE_URL") or read_credentials().get("PUB_BASE_URL")
+    if not url and not os.path.exists(CREDENTIALS):
+        sys.exit(f"Missing {CREDENTIALS}. See the README: one bucket-scoped R2 token per machine.")
+    if not url:
+        sys.exit(f"PUB_BASE_URL is not set. Add PUB_BASE_URL=https://your-pages-domain to {CREDENTIALS}.")
+    return url.rstrip("/")
+
+
+def load_credentials():
+    if not os.path.exists(CREDENTIALS):
+        sys.exit(f"Missing {CREDENTIALS}. See the README: one bucket-scoped R2 token per machine.")
+    creds = read_credentials()
+    for k in ("R2_ACCOUNT_ID", "R2_BUCKET", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY"):
+        if not creds.get(k):
+            sys.exit(f"{k} is empty in {CREDENTIALS}")
+    return creds
+
+
+def load_manifest():
+    try:
+        with open(MANIFEST) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+
+def save_manifest(manifest):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    tmp = MANIFEST + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(manifest, f, indent=2)
+    os.replace(tmp, MANIFEST)
+
+
+def slug(name):
+    base, ext = os.path.splitext(os.path.basename(name))
+    base = re.sub(r"[^a-z0-9]+", "-", base.lower()).strip("-") or "page"
+    return base + (ext.lower() or ".html")
+
+
+def put_object(creds, key, body, content_type):
+    """S3 SigV4 PUT to R2."""
+    host = f"{creds['R2_ACCOUNT_ID']}.r2.cloudflarestorage.com"
+    path = "/" + urllib.parse.quote(f"{creds['R2_BUCKET']}/{key}")
+    now = datetime.datetime.now(datetime.timezone.utc)
+    amz_date, day = now.strftime("%Y%m%dT%H%M%SZ"), now.strftime("%Y%m%d")
+    payload_hash = hashlib.sha256(body).hexdigest()
+    headers = {
+        "content-type": content_type,
+        "host": host,
+        "x-amz-content-sha256": payload_hash,
+        "x-amz-date": amz_date,
+    }
+    signed = ";".join(sorted(headers))
+    canonical = "\n".join(
+        ["PUT", path, "", "".join(f"{k}:{headers[k]}\n" for k in sorted(headers)), signed, payload_hash]
+    )
+    scope = f"{day}/auto/s3/aws4_request"
+    to_sign = "\n".join(["AWS4-HMAC-SHA256", amz_date, scope, hashlib.sha256(canonical.encode()).hexdigest()])
+
+    def h(key_, msg):
+        return hmac.new(key_, msg.encode(), hashlib.sha256).digest()
+
+    k = h(h(h(h(("AWS4" + creds["R2_SECRET_ACCESS_KEY"]).encode(), day), "auto"), "s3"), "aws4_request")
+    signature = hmac.new(k, to_sign.encode(), hashlib.sha256).hexdigest()
+    headers["authorization"] = (
+        f"AWS4-HMAC-SHA256 Credential={creds['R2_ACCESS_KEY_ID']}/{scope}, "
+        f"SignedHeaders={signed}, Signature={signature}"
+    )
+    del headers["host"]
+    req = urllib.request.Request(f"https://{host}{path}", data=body, headers=headers, method="PUT")
+    try:
+        urllib.request.urlopen(req).close()
+    except urllib.error.HTTPError as e:
+        sys.exit(f"Upload of {key} failed: {e.code} {e.read().decode(errors='replace')[:500]}")
+
+
+def main():
+    p = argparse.ArgumentParser(description="Publish a page to your pages site")
+    p.add_argument("file", nargs="?")
+    p.add_argument("--name", help="published file name (first publish only)")
+    p.add_argument("--new", action="store_true", help="start a new link for this file")
+    p.add_argument("--list", action="store_true", help="list published pages")
+    args = p.parse_args()
+
+    manifest = load_manifest()
+    base = base_url()
+    if args.list:
+        for path, e in sorted(manifest.items()):
+            print(f"{base}/w/{e['token']}/{e['name']}  v{e['version']}  {e['updated']}  {path}")
+        return
+    if not args.file:
+        p.error("FILE is required")
+
+    path = os.path.realpath(args.file)
+    with open(path, "rb") as f:
+        body = f.read()
+
+    entry = None if args.new else manifest.get(path)
+    if entry is None:
+        entry = {"token": secrets.token_urlsafe(16), "name": slug(args.name or path), "version": 0}
+    elif args.name and slug(args.name) != entry["name"]:
+        sys.exit(f"Already published as {entry['name']}; use --new to rename.")
+
+    content_type = mimetypes.guess_type(entry["name"])[0] or "application/octet-stream"
+    if content_type.startswith("text/"):
+        content_type += "; charset=utf-8"
+
+    creds = load_credentials()
+    version = entry["version"] + 1
+    prefix = f"w/{entry['token']}"
+    put_object(creds, f"{prefix}/v{version}/{entry['name']}", body, content_type)
+    put_object(creds, f"{prefix}/{entry['name']}", body, content_type)
+
+    entry.update(version=version, updated=datetime.datetime.now().isoformat(timespec="seconds"))
+    manifest[path] = entry
+    save_manifest(manifest)
+
+    print(f"{base}/{prefix}/{entry['name']}")
+    print(f"  frozen v{version}: {base}/{prefix}/v{version}/{entry['name']}")
+
+
+if __name__ == "__main__":
+    main()

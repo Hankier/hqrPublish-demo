@@ -1,0 +1,12 @@
+{
+  "name": "hqr-publish",
+  "description": "hqrPublish: page publishing for Claude Code",
+  "owner": { "name": "Hankier" },
+  "plugins": [
+    {
+      "name": "hqr-publish",
+      "source": "./",
+      "description": "pub command + go-publish skill: HTML pages to your own R2 site with unguessable links"
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "go-pages",
+  "main": "src/index.js",
+  "compatibility_date": "2026-10-01",
+  "workers_dev": false,
+  "preview_urls": false,
+  // Replace with your own domain (its zone must be on your Cloudflare account).
+  "routes": [{ "pattern": "pages.example.com", "custom_domain": true }],
+  "r2_buckets": [{ "binding": "PAGES", "bucket_name": "go-pages" }],
+  "observability": { "enabled": true }
+}
